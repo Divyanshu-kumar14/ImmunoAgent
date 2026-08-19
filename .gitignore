@@ -25,6 +25,9 @@ out/
 .vscode/
 .DS_Store
 
+# Token optimizer
+.token-optimizer/
+
 # OTel / local artifacts
 *.log
 
