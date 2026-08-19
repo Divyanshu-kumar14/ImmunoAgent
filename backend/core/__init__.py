@@ -1,0 +1,1 @@
+"""Core cross-cutting services: auth, gateway, model armor, tracing (Phase 1)."""

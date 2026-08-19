@@ -1,0 +1,94 @@
+# ImmunoAgent stack (Phase 0): db + redis are the two fast-path dependencies;
+# backend/frontend images are built in later phases (Dockerfiles land with the
+# code that needs them). Compose auto-loads `.env` for ${VAR} interpolation —
+# never commit real values; copy `.env.example` to `.env` first.
+
+services:
+  # --- Postgres + pgvector (PRD §4.1) ---
+  # Chosen over bare postgres because the Memory Bank needs the `vector`
+  # extension + HNSW index for 768-dim semantic search. `pgvector/pgvector:pg16`
+  # ships with the extension pre-enabled at the image level.
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: immunoagent_db
+    environment:
+      POSTGRES_USER: immunoagent
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: immunoagent
+    ports:
+      - "5432:5432"
+    volumes:
+      # Named volume: survives `compose down`; data outlives container rebuilds.
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # `pg_isready` is the zero-dependency readiness probe; backend waits on
+      # this (depends_on: condition: service_healthy) so it never boots into a
+      # half-initialized database.
+      test: ["CMD-SHELL", "pg_isready -U immunoagent -d immunoagent"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # --- Redis 7 (fast-path store, PRD §4.2) ---
+  # Hosts the DAG (hash), edges (set), telemetry stream, and the JWT jti
+  # deny-list. All deny-list/DAG lookups are O(1) hash/set ops, which is what
+  # keeps the rule-based security fast path well under the 25 ms P95 budget.
+  redis:
+    image: redis:7-alpine
+    container_name: immunoagent_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"] # PONG = ready; cheap O(1) probe
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # --- Backend API (uvicorn) ---
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: immunoagent_backend
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # In-cluster hostnames (db/redis) differ from localhost; override for the
+      # containerized backend only. `.env` values are used for local runs.
+      - DATABASE_URL=postgresql://immunoagent:secret@db:5432/immunoagent
+      - REDIS_URL=redis://redis:6379/0
+      # Secret is interpolated from `.env` at compose time — never hardcode.
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    ports:
+      - "8000:8000"
+    volumes:
+      # Bind-mount source for hot reload during development.
+      - .:/app
+    restart: unless-stopped
+
+  # --- Frontend dashboard (Next.js, Phase 4) ---
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.frontend
+    container_name: immunoagent_frontend
+    depends_on:
+      - backend
+    environment:
+      # Browser-side base URL for REST/WS calls (NEXT_PUBLIC_* is inlined at
+      # build time, so it must be the externally reachable address).
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
