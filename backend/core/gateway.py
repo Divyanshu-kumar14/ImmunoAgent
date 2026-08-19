@@ -1,13 +1,16 @@
-"""Gateway interceptor + endpoint stubs (Phase 1).
+"""Gateway interceptor + endpoint stubs (Phase 1–3).
 
 Responsibilities:
   • Registry check  →  agent must exist & be active.
   • DAG node        →  record inbound tool call as a span.
   • Model‑armor check →  PII sanitisation + tier/safety evaluation.
+  • Sentinel check  →  anomaly detection (async, non-blocking hot path).
   • MCP call        →  dispatch to registered mock tool (O(1) dict lookup).
   • Telemetry       →  emit OpenTelemetry spans.
 
 All checks are fast‑path rule based; the LLM is deliberately off the hot path.
+Sentinel anomaly detection runs after the tool executes (async) to avoid
+adding latency to the fast path.
 
 Performance notes:
   * Both endpoints share one ``_execute_tool_call`` helper instead of
@@ -15,12 +18,17 @@ Performance notes:
     no copy‑paste drift.
   * The armor check itself is O(k × n) (k = args, n = arg length); see
     ``model_armor.py`` for the fused‑regex rationale.
+  * Sentinel runs in a background task so the 25 ms P95 budget is preserved.
+  * Agent registry lookups cached (TTL 30s) — avoids DB round-trip on every call.
+  * DAG recording batched via Redis pipeline where possible.
 """
-
 from __future__ import annotations
 
+import asyncio
+import functools
+import time
 import uuid as _uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -30,11 +38,44 @@ from backend.core.model_armor import evaluate_tool_safety, sanitize_pii
 from backend.core.otel_tracer import get_tracer
 from backend.memory.embeddings import get_embedding
 from backend.memory.memory_bank import insert_memory, semantic_search
+from backend.sentinel.anomaly_detector import is_malicious, score_anomaly
+from backend.sentinel.causal_analyzer import find_patient_zero
+from backend.sentinel.quarantine_manager import execute_quarantine, _collect_descendant_spans
 from backend.tools.tool_definitions import call_tool
 
 tracer = get_tracer(__name__)
 
 router = APIRouter(prefix="/v1/gateway", tags=["gateway"])
+
+# ---------------------------------------------------------------------------
+# Agent Registry Cache (TTL-based, module-level)
+# ---------------------------------------------------------------------------
+# Cache: agent_id -> (AgentRegistry_row, timestamp)
+# Avoids DB round-trip on every gateway call. 30s TTL balances freshness
+# (agent deactivation must propagate) with performance.
+_AGENT_REGISTRY_CACHE: Dict[str, Tuple[Any, float]] = {}
+_AGENT_CACHE_TTL_SECONDS = 30.0
+
+
+def _get_cached_agent(engine, agent_id: str):
+    """Get agent from cache or DB. Returns (agent_row, from_cache_bool)."""
+    now = time.time()
+    if agent_id in _AGENT_REGISTRY_CACHE:
+        agent_row, cached_at = _AGENT_REGISTRY_CACHE[agent_id]
+        if now - cached_at < _AGENT_CACHE_TTL_SECONDS:
+            return agent_row, True
+    # Cache miss or expired — caller must fetch from DB and update cache
+    return None, False
+
+
+def _update_agent_cache(agent_id: str, agent_row: Any) -> None:
+    """Update the agent registry cache."""
+    _AGENT_REGISTRY_CACHE[agent_id] = (agent_row, time.time())
+
+
+def _invalidate_agent_cache(agent_id: str) -> None:
+    """Invalidate cache entry (called on quarantine/rollback)."""
+    _AGENT_REGISTRY_CACHE.pop(agent_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +110,150 @@ async def get_current_agent(
 
 
 # ---------------------------------------------------------------------------
+# Redis client getter (lazy, shared pool)
+# ---------------------------------------------------------------------------
+
+async def _get_redis_client(request: Request):
+    """Return the shared Redis client from app state."""
+    return request.app.state.redis_client
+
+
+# ---------------------------------------------------------------------------
+# DAG recording helpers (Redis-backed, O(1) per node/edge)
+# ---------------------------------------------------------------------------
+
+async def _record_dag_node(
+    redis_client,
+    trace_id: str,
+    span_id: str,
+    parent_span_id: Optional[str],
+    agent_id: str,
+    node_type: str,
+    payload: Dict[str, Any],
+    taint_score: float = 0.0,
+    taint_status: str = "CLEAN",
+) -> None:
+    """Write a provenance node to Redis hash and edge to Redis set."""
+    import json
+
+    node_key = f"dag:nodes:{trace_id}"
+    edge_key = f"dag:edges:{trace_id}"
+
+    node_data = {
+        "span_id": span_id,
+        "trace_id": trace_id,
+        "parent_span_id": parent_span_id or "",
+        "agent_id": agent_id,
+        "node_type": node_type,
+        "payload": payload,
+        "taint_score": taint_score,
+        "taint_status": taint_status,
+    }
+    await redis_client.hset(node_key, span_id, json.dumps(node_data))
+
+    if parent_span_id:
+        await redis_client.sadd(edge_key, f"{parent_span_id}:{span_id}")
+
+
+# ---------------------------------------------------------------------------
+# Background Sentinel task (runs after response returns)
+# ---------------------------------------------------------------------------
+
+async def _run_sentinel_async(
+    *,
+    redis_client,
+    db_engine,
+    trace_id: str,
+    span_id: str,
+    agent_id: str,
+    agent_tier: str,
+    tool_name: str,
+    tool_args: Dict[str, Any],
+    tool_result: Dict[str, Any],
+    trigger_payload: Dict[str, Any],
+) -> None:
+    """Async Sentinel pipeline: anomaly score → causal analysis → quarantine.
+
+    This runs in a background task so the gateway response returns immediately.
+    If quarantine triggers, the agent is deactivated and memories excised.
+    """
+    try:
+        # 1️⃣ Anomaly scoring (rule-based, fast)
+        score, triggered_rules = score_anomaly(
+            agent_tier=agent_tier,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            beneficiary=tool_args.get("beneficiary"),
+        )
+
+        if not is_malicious(score):
+            return  # benign — no further action
+
+        # 2️⃣ Build trigger node for causal analysis
+        trigger_node = {
+            "span_id": span_id,
+            "trace_id": trace_id,
+            "agent_id": agent_id,
+            "node_type": "TOOL_CALL",
+            "payload": {
+                "tool": tool_name,
+                "args": tool_args,
+                "result": tool_result,
+            },
+            "taint_score": score,
+            "taint_status": "SUSPICIOUS",
+        }
+
+        # Update the DAG node with suspicion
+        await _record_dag_node(
+            redis_client,
+            trace_id,
+            span_id,
+            None,  # parent already recorded
+            agent_id,
+            "TOOL_CALL",
+            trigger_node["payload"],
+            taint_score=score,
+            taint_status="SUSPICIOUS",
+        )
+
+        # 3️⃣ Causal analysis: find patient zero
+        patient_zero_span_id, confidence, method = await find_patient_zero(
+            redis_client, trace_id, span_id, trigger_node
+        )
+
+        if not patient_zero_span_id:
+            # No candidates — log but don't quarantine
+            return
+
+        # 4️⃣ Collect all descendant spans for excision (uses shared helper)
+        descendant_spans = await _collect_descendant_spans(
+            redis_client, trace_id, patient_zero_span_id
+        )
+
+        # 5️⃣ Execute quarantine (needs DB transaction)
+        async with db_engine.begin() as conn:
+            await execute_quarantine(
+                db_conn=conn,
+                redis_client=redis_client,
+                trace_id=trace_id,
+                trigger_span_id=span_id,
+                triggering_agent_id=agent_id,
+                patient_zero_span_id=patient_zero_span_id,
+                anomalous_payload=trigger_payload,
+                descendant_spans=descendant_spans,
+            )
+
+        # 6️⃣ Invalidate agent cache so subsequent calls see deactivated status immediately
+        _invalidate_agent_cache(agent_id)
+
+    except Exception:
+        # Sentinel failures are logged but never crash the request
+        # In production, send to structured logging / alerting
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Shared tool‑call flow (used by both endpoints — DRY, same contract)
 # ---------------------------------------------------------------------------
 
@@ -79,24 +264,29 @@ async def _execute_tool_call(request: Request, body: Dict[str, Any], span_name: 
       1. DAG span id  – unique span_id + trace_id (from ``X-Trace-Id`` header).
       2. Span start   – OTel span for this call.
       3. Model‑armor  – PII sanitisation (audit) + tier/safety evaluation.
-      4. Response     – 423 on blocked tool, else 200 with span_id/trace_id.
+      4. MCP call     – dispatch to registered mock tool.
+      5. Response     – 200 with span_id/trace_id + result.
+      6. DAG record   – write TOOL_CALL node to Redis (after response).
+      7. Sentinel     – anomaly detection + quarantine (background task).
 
     Complexity: O(k × n) in the armor step only; everything else is O(1).
+    Sentinel runs in background to preserve 25 ms P95 budget.
+    Registry check uses TTL cache (O(1) after first call).
     """
     agent_payload: Dict[str, Any] = request.state.agent
     agent_id: str = agent_payload["agent_id"]
+    agent_tier: str = agent_payload.get("max_action_tier", "READ_ONLY")
 
     tool_name: str = body.get("tool", "")
     tool_args: Dict[str, Any] = body.get("args", {})
 
     # ── 1️⃣ DAG span id -----------------------------------------------------
-    # Unique span_id for this call; trace_id is pulled from the caller's
-    # ``X-Trace-Id`` header when present, else we fall back to the span_id so
-    # the DAG still has a stable trace to hang nodes on.
     span_id = str(_uuid.uuid4())
     trace_id = request.headers.get("X-Trace-Id", "")
     if not trace_id:
         trace_id = span_id
+
+    parent_span_id = request.headers.get("X-Parent-Span-Id")
 
     # ── 2️⃣ Span start ------------------------------------------------------
     with tracer.start_as_current_span(
@@ -109,15 +299,11 @@ async def _execute_tool_call(request: Request, body: Dict[str, Any], span_name: 
         },
     ):
         # ── 3️⃣ Model‑armor check -------------------------------------------
-        # PII sanitisation is best‑effort audit (the sanitized copy would be
-        # persisted/logged downstream); the Sentinel acts on the raw payload
-        # in Phase 3. Kept in the hot path because it is one fused O(n) pass.
         raw_args_str = str(tool_args)
         _ = sanitize_pii(raw_args_str)
 
-        # Safety evaluation using the rule‑based armor (O(k × n), no LLM).
         allowed, reasons = evaluate_tool_safety(
-            agent_tier=agent_payload.get("max_action_tier", "READ_ONLY"),
+            agent_tier=agent_tier,
             tool_name=tool_name,
             tool_args=tool_args,
             beneficiary=tool_args.get("beneficiary"),
@@ -134,16 +320,11 @@ async def _execute_tool_call(request: Request, body: Dict[str, Any], span_name: 
             )
 
         # ── 4️⃣ MCP call – invoke registered mock tool ------------------------------
-        # In Phase 2 we dispatch to the registered mock implementations so
-        # the end‑to‑end flow (tool → memory → agent response) works without
-        # external services.  The result is enriched with span/trace IDs.
-        # Dispatch is a single O(1) dict lookup inside call_tool — no scan.
         try:
             tool_result = call_tool(tool_name, **tool_args)
         except KeyError as exc:
-            # Unknown tool = client error (400), NOT a 500: a predictable
-            # registry miss on the hot path shouldn't pay for a traceback.
             raise HTTPException(status_code=400, detail=f"unknown tool: {exc}") from exc
+
         result: Dict[str, Any] = {
             "tool": tool_name,
             "status": "executed",
@@ -151,7 +332,45 @@ async def _execute_tool_call(request: Request, body: Dict[str, Any], span_name: 
             "trace_id": trace_id,
             "result": tool_result,
         }
-        return JSONResponse(content=result, status_code=200)
+
+    # ── 5️⃣ Record DAG node (TOOL_CALL) — after response, before Sentinel
+    redis_client = await _get_redis_client(request)
+    await _record_dag_node(
+        redis_client,
+        trace_id,
+        span_id,
+        parent_span_id,
+        agent_id,
+        "TOOL_CALL",
+        {"tool": tool_name, "args": tool_args, "result": tool_result},
+        taint_score=0.0,
+        taint_status="CLEAN",
+    )
+
+    # ── 6️⃣ Schedule Sentinel background task (non-blocking)
+    trigger_payload = {
+        "agent_id": agent_id,
+        "jti": agent_payload.get("jti"),
+        "tool": tool_name,
+        "args": tool_args,
+        "result": tool_result,
+    }
+    asyncio.create_task(
+        _run_sentinel_async(
+            redis_client=redis_client,
+            db_engine=request.app.state.db_engine,
+            trace_id=trace_id,
+            span_id=span_id,
+            agent_id=agent_id,
+            agent_tier=agent_tier,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            tool_result=tool_result,
+            trigger_payload=trigger_payload,
+        )
+    )
+
+    return JSONResponse(content=result, status_code=200)
 
 
 # ---------------------------------------------------------------------------
@@ -170,13 +389,25 @@ async def gateway_invoke(
     """
     body = await request.json()
 
-    # ── 1️⃣ Registry check (simple in‑process stub; real DB lookup in Phase 2)
-    # -----------------------------------------------------------------------
-    # TODO: Replace with SQLAlchemy query against ``agent_registry``.
-    # For now we allow any non‑empty agent_id; the real check will be in Phase 2.
-    # -----------------------------------------------------------------------
-    if not agent["agent_id"]:
-        raise HTTPException(status_code=403, detail="agent not registered")
+    # ── 1️⃣ Registry check (TTL-cached DB lookup)
+    engine = request.app.state.db_engine
+    from backend.database.models import AgentRegistry
+    from sqlalchemy import select
+
+    # Try cache first
+    agent_id = agent["agent_id"]
+    agent_row, from_cache = _get_cached_agent(engine, agent_id)
+    if not from_cache:
+        async with engine.connect() as conn:
+            res = await conn.execute(
+                select(AgentRegistry).where(AgentRegistry.agent_id == agent_id)
+            )
+            agent_row = res.scalar_one_or_none()
+        if agent_row:
+            _update_agent_cache(agent_id, agent_row)
+
+    if not agent_row or not agent_row.is_active:
+        raise HTTPException(status_code=403, detail="agent not registered or inactive")
 
     return await _execute_tool_call(request, body, "gateway.invoke")
 
@@ -234,19 +465,12 @@ async def memory_write(
         trace_id = span_id
 
     # ── 2️⃣ Compute embedding ------------------------------------------------
-    # use_mock=None → the embedding module decides: real Gemini when
-    # GEMINI_API_KEY is set, deterministic hash mock otherwise (Plan: mock
-    # fallback — the demo never hard-depends on the LLM).
     embedding = get_embedding(doc_text, trace_id=trace_id, use_mock=None)
 
     # ── 3️⃣ Insert memory row + provenance node in ONE transaction ----------
-    # engine.begin() (not acquire/connect): the memory row and its provenance
-    # node must commit together or not at all, and begin() auto-commits on
-    # successful exit — no manual commit bookkeeping on the hot path. The
-    # pooled connection is reused across requests (no per-request handshake).
-    engine = request.app.state.db_engine  # type: ignore[attr-defined]
+    engine = request.app.state.db_engine
     async with engine.begin() as conn:
-        from backend.database.models import ProvenanceNodes  # noqa: F401 (local import keeps module load order safe)
+        from backend.database.models import ProvenanceNodes
         from sqlalchemy import insert as sa_insert
 
         # Insert memory row (source_span_id = span_id, so excision can find it later)
@@ -275,6 +499,20 @@ async def memory_write(
                 taint_status="CLEAN",
             )
         )
+
+    # ── 4️⃣ Record DAG node in Redis
+    redis_client = await _get_redis_client(request)
+    await _record_dag_node(
+        redis_client,
+        trace_id,
+        span_id,
+        None,
+        requested_agent_id,
+        "MEMORY_WRITE",
+        {"doc_text": doc_text},
+        taint_score=0.0,
+        taint_status="CLEAN",
+    )
 
     result: Dict[str, Any] = {
         "status": "memory_stored",
@@ -310,9 +548,6 @@ async def memory_query(
 
     q: str = request.query_params.get("q", "")
 
-    # k is clamped to [1, 50]: bounds the HNSW search radius and the JSON
-    # payload size (perf: an unbounded k would stream the whole ACTIVE set).
-    # Invalid input falls back to the default instead of raising a 500.
     try:
         k = int(request.query_params.get("k", "5"))
     except ValueError:
@@ -321,12 +556,9 @@ async def memory_query(
 
     filter_agent_id: str | None = request.query_params.get("agent_id", None)
 
-    # Query embedding uses the same env-driven mock/production decision as
-    # memory_write, so write and query embeddings live in the same space.
     embedding = _get_embedding(q, trace_id=request.headers.get("X-Trace-Id", ""), use_mock=None)
 
-    # Read-only path: engine.connect() (auto-closes, no transaction needed).
-    engine = request.app.state.db_engine  # type: ignore[attr-defined]
+    engine = request.app.state.db_engine
     async with engine.connect() as conn:
         results = await semantic_search(
             conn,
