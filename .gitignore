@@ -1,0 +1,33 @@
+# Secrets — never commit
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node (frontend, Phase 4)
+node_modules/
+.next/
+out/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# OTel / local artifacts
+*.log
+
+# PRD Files
+*_PRD.md
+immunoagent-implementation-plan.md

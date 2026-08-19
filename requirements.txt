@@ -1,0 +1,30 @@
+# ImmunoAgent backend dependencies (Phase 0)
+# Grouped by concern; versions unpinned for hackathon velocity.
+
+# --- Web framework / ASGI ---
+fastapi
+uvicorn[standard]
+
+# --- Database: async SQLAlchemy + Postgres/pgvector ---
+sqlalchemy[asyncio]
+asyncpg
+pgvector
+
+# --- Fast-path store: Redis (DAG, deny-list, telemetry stream) ---
+redis
+
+# --- AI: Gemini SDK (Sentinel analysis + embeddings) ---
+google-genai
+
+# --- Auth: ephemeral JWTs (HS256, 5-min TTL) ---
+PyJWT
+
+# --- Config ---
+pydantic-settings
+
+# --- Observability: OpenTelemetry spans ---
+opentelemetry-sdk
+
+# --- Dev / test ---
+pytest
+httpx
